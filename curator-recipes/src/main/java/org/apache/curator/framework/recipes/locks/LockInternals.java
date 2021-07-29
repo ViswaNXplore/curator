@@ -57,6 +57,14 @@ public class LockInternals
             {
                 checkRevocableWatcher(event.getPath());
             }
+            if ( event.getType() == Watcher.Event.EventType.NodeDeleted )
+            {
+                RevocationSpec  entry = revocable.get();
+                if ( entry != null )
+                {
+                    entry.getExecutor().execute(entry.getRunnable());
+                }
+            }
         }
     };
 
