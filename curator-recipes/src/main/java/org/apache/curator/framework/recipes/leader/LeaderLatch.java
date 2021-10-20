@@ -50,6 +50,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.curator.utils.PathUtils;
 
@@ -73,6 +74,12 @@ public class LeaderLatch implements Closeable
     private final StandardListenerManager<LeaderLatchListener> listeners = StandardListenerManager.standard();
     private final CloseMode closeMode;
     private final AtomicReference<Future<?>> startTask = new AtomicReference<Future<?>>();
+    public final CountDownLatch nonLeaderThreadWaitLatch = new CountDownLatch(1);
+
+    public final CountDownLatch leaderThread1WaitLatch = new CountDownLatch(1);
+    public final CountDownLatch leaderThread2WaitLatch = new CountDownLatch(1);
+    public final CountDownLatch leaderThread2WaitLatch1 = new CountDownLatch(1);
+    final AtomicInteger reconnectedCount = new AtomicInteger(0);
 
     private final ConnectionStateListener listener = new ConnectionStateListener()
     {
@@ -499,8 +506,50 @@ public class LeaderLatch implements Closeable
     @VisibleForTesting
     void reset() throws Exception
     {
+        // Resetting leadership
         setLeadership(false);
+
+        /**
+         *  [Dual Leadership Issue] : Code injected for testing
+         */
+        if(Thread.currentThread().getName().contains("leader-thread-2")
+                && reconnectedCount.get() == 2){
+            // Releasing leader-thread-1 await() for "checking its leadership"
+            leaderThread1WaitLatch.countDown();
+            // Pausing leader-thread-2 before "deleting its latch node in zookeeper"
+            leaderThread2WaitLatch.await();
+        }
+
+        // Deleting its latch node in zookeeper
+        log.info("Deleting its latch node [" + ourPath.get() + "] in zookeeper");
         setNode(null);
+
+        /**
+         *  [Dual Leadership Issue] : Code injected for testing
+         */
+        if(Thread.currentThread().getName().contains("leader-thread-2")
+                && reconnectedCount.get() == 2){
+            // Releasing non-leader-thread await() for "creating its sequential latch node in zookeeper"
+            nonLeaderThreadWaitLatch.countDown();
+        }
+
+        /**
+         *  [Dual Leadership Issue] : Code injected for testing
+         */
+        if(Thread.currentThread().getName().contains("leader-thread-2")
+                && reconnectedCount.get() == 2){
+            // Pausing leader-thread-2 before "creating its sequential latch node in zookeeper"
+            leaderThread2WaitLatch1.await();
+        }
+
+        /**
+         *  [Dual Leadership Issue] : Code injected for testing
+         */
+        String currentThreadName = Thread.currentThread().getName();
+        if(currentThreadName.contains("non-leader-thread")){
+            // Pausing non-leader-thread before "creating its sequential latch node in zookeeper"
+            nonLeaderThreadWaitLatch.await();
+        }
 
         BackgroundCallback callback = new BackgroundCallback()
         {
@@ -520,8 +569,17 @@ public class LeaderLatch implements Closeable
                     {
                         setNode(null);
                     }
-                    else
-                    {
+                    else{
+                        log.info("Node created successfully : " + event.getName());
+
+                        /**
+                         *  [Dual Leadership Issue] : Code injected for testing
+                         */
+                        if(Thread.currentThread().getName().contains("leader-thread-1") || (Thread.currentThread().getName().contains("Thread-2-EventThread") && reconnectedCount.get() >= 1)){
+                            // Pausing leader-thread-1 before "checking its leadership"
+                            leaderThread1WaitLatch.await();
+                        }
+
                         getChildren();
                     }
                 }
@@ -572,6 +630,20 @@ public class LeaderLatch implements Closeable
         else if ( ourIndex == 0 )
         {
             setLeadership(true);
+            /**
+             *  [Dual Leadership Issue] : Code injected for testing
+             */
+            if(Thread.currentThread().getName().contains("leader-thread-1") || (Thread.currentThread().getName().contains("Thread-2-EventThread") && reconnectedCount.get() >= 1)){
+                // Releasing leader-thread-2 await() for "deleting its latch node in zookeeper"
+                leaderThread2WaitLatch.countDown();
+            }
+            /**
+             *  [Dual Leadership Issue] : Code injected for testing
+             */
+            if(Thread.currentThread().getName().contains("Thread-3-EventThread")){
+                // Releasing all remaining waiting threads
+                leaderThread2WaitLatch1.countDown();
+            }
         }
         else
         {
@@ -585,6 +657,15 @@ public class LeaderLatch implements Closeable
                     {
                         try
                         {
+                            log.info("Node Deleted Event : Previous node deleted");
+                            /**
+                             *  [Dual Leadership Issue] : Code injected for testing
+                             */
+                            if(Thread.currentThread().getName().contains("Thread-3-EventThread")){
+                                // Pausing non-leader-thread (event-thread) before "creating its sequential latch node in zookeeper"
+                                nonLeaderThreadWaitLatch.await();
+                                Thread.sleep(1000);
+                            }
                             getChildren();
                         }
                         catch ( Exception ex )
@@ -629,6 +710,11 @@ public class LeaderLatch implements Closeable
         client.getChildren().inBackground(callback).forPath(ZKPaths.makePath(latchPath, null));
     }
 
+    public void fireReconnectEvent(){
+        reconnectedCount.getAndIncrement();
+        handleStateChange(ConnectionState.RECONNECTED);
+    }
+
     @VisibleForTesting
     protected void handleStateChange(ConnectionState newState)
     {
@@ -646,6 +732,7 @@ public class LeaderLatch implements Closeable
                 {
                     if ( client.getConnectionStateErrorPolicy().isErrorState(ConnectionState.SUSPENDED) || !hasLeadership.get() )
                     {
+                        log.info("Received Reconnected Event, Reconnected count [" + reconnectedCount.get() + "] : Resetting leadership");
                         reset();
                     }
                 }
